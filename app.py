@@ -1,73 +1,68 @@
-from flask import Flask, render_template, request
-from PIL import Image, ExifTags
-import numpy as np
-import os
-import cv2
-
-app = Flask(__name__)
-
-UPLOAD_FOLDER = "static/uploads"
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-
 def analyze_image(image_path):
-    img = Image.open(image_path)
+    img = Image.open(image_path).convert("RGB")
     img_np = np.array(img)
+    gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
 
-    # 1️⃣ Noise Score (variance of grayscale)
-    gray = cv2.cvtColor(img_np, cv2.COLOR_BGR2GRAY)
-    noise_variance = np.var(gray)
-    noise_score = min(noise_variance / 5000, 1.0)
+    h, w = gray.shape
 
-    # 2️⃣ Edge Score (Canny edge density)
+    # 1️⃣ Frequency Domain Analysis (FFT)
+    f = np.fft.fft2(gray)
+    fshift = np.fft.fftshift(f)
+    magnitude = np.log(np.abs(fshift) + 1)
+    freq_score = np.clip(np.var(magnitude) / 50000, 0, 1)
+
+    # 2️⃣ Noise Inconsistency
+    noise = gray - cv2.GaussianBlur(gray, (5, 5), 0)
+    noise_score = np.clip(np.var(noise) / 2000, 0, 1)
+
+    # 3️⃣ Edge Coherence
     edges = cv2.Canny(gray, 100, 200)
-    edge_density = np.sum(edges) / (gray.shape[0] * gray.shape[1])
-    edge_score = min(edge_density * 5, 1.0)
+    edge_density = np.sum(edges > 0) / (h * w)
+    edge_score = np.clip(edge_density * 2.0, 0, 1)
 
-    # 3️⃣ Compression Score (block artifact detection)
-    laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
-    compression_score = min(1 - (laplacian_var / 1000), 1.0)
-    compression_score = max(compression_score, 0)
+    # 4️⃣ Texture Entropy
+    hist = cv2.calcHist([gray],[0],None,[256],[0,256])
+    hist_norm = hist / hist.sum()
+    entropy = -np.sum(hist_norm * np.log2(hist_norm + 1e-7))
+    entropy_score = np.clip((entropy - 5) / 3, 0, 1)
 
-    # 4️⃣ Metadata Score
-    metadata_score = 1.0
+    # 5️⃣ JPEG Block Artifact Detection
+    block_diff = np.mean(np.abs(np.diff(gray, axis=0))) + \
+                 np.mean(np.abs(np.diff(gray, axis=1)))
+    compression_score = np.clip(block_diff / 50, 0, 1)
+
+    # 6️⃣ Metadata Integrity
+    metadata_score = 0.2
     try:
         exif = img._getexif()
-        if exif is not None:
-            metadata_score = 0.2
+        if exif is None:
+            metadata_score = 0.6
+        else:
+            metadata_score = 0.1
     except:
-        metadata_score = 1.0
+        metadata_score = 0.6
 
-    # Weighted probability
-    probability = (
-        0.35 * noise_score +
-        0.30 * edge_score +
-        0.20 * compression_score +
-        0.15 * metadata_score
+    # 7️⃣ Face Region Boost (Optional if OpenCV Haar loaded)
+    face_score = 0
+    face_cascade = cv2.CascadeClassifier(
+        cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+    )
+    faces = face_cascade.detectMultiScale(gray, 1.3, 5)
+    if len(faces) > 0:
+        face_score = 0.2
+
+    # Weighted Risk Score
+    raw_score = (
+        0.20 * freq_score +
+        0.15 * noise_score +
+        0.15 * edge_score +
+        0.15 * entropy_score +
+        0.15 * compression_score +
+        0.10 * metadata_score +
+        0.10 * face_score
     )
 
+    # Calibration bias toward natural images
+    probability = np.clip((raw_score - 0.25) * 1.3, 0, 1)
+
     return round(probability * 100, 2)
-
-@app.route("/", methods=["GET", "POST"])
-def index():
-    probability = None
-    risk = None
-
-    if request.method == "POST":
-        file = request.files["image"]
-        if file:
-            path = os.path.join(UPLOAD_FOLDER, file.filename)
-            file.save(path)
-
-            probability = analyze_image(path)
-
-            if probability > 70:
-                risk = "HIGH"
-            elif probability > 40:
-                risk = "MEDIUM"
-            else:
-                risk = "LOW"
-
-    return render_template("index.html", probability=probability, risk=risk)
-
-if __name__ == "__main__":
-    app.run(debug=True)
